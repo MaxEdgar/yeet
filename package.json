@@ -1,5 +1,5 @@
 {
-  "name": "yeet",
+  "name": "@maxedgar/yeet",
   "version": "0.3.1",
   "description": "yeet any video from YouTube, X, Instagram, Threads & 1800+ sites — right from your terminal. paste. yeet. done.",
   "type": "module",
