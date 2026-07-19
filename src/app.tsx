@@ -9,20 +9,23 @@ import {FullScreen} from './components/fullscreen.js'
 import {Logo} from './components/logo.js'
 import {Panel} from './components/panel.js'
 import {ProgressBar} from './components/progress-bar.js'
+import {QueueList} from './components/queue-list.js'
 import {Shortcuts} from './components/shortcuts.js'
 import {TextInput} from './components/text-input.js'
+import {batchSummary, makeBatchItems, type BatchItem} from './lib/batch.js'
 import {clickTargetAt, findFrameRow, frameRowSpan, type ClickTarget} from './lib/click-map.js'
 import {formatBytes, formatDuration, formatEta, formatSpeed, shortenPath, truncate, wrapText} from './lib/format.js'
 import {addToHistory, loadHistory} from './lib/history.js'
 import {detectPlatform, isProbablyUrl, type Platform} from './lib/platforms.js'
 import {useMouseClick} from './lib/use-mouse-click.js'
-import {nextThemeMode, ThemeProvider, type ThemeMode, useTheme} from './theme.js'
+import {nextThemeMode, ThemeProvider, type Theme, type ThemeMode, useTheme} from './theme.js'
 import {
   buildChoices,
   download,
   ensureYtDlp,
   findFfmpeg,
   probe,
+  QUEUE_PRESETS,
   type DownloadChoice,
   type DownloadProgress,
   type VideoInfo,
@@ -83,7 +86,76 @@ function indeterminateMeta(progress: DownloadProgress): string {
   return `${partLabel(progress)}${bytes.padStart(8)}  ${speed.padEnd(10)}`
 }
 
-export type Outcome = {filepath?: string}
+/**
+ * The bar/spinner/meta block for an in-progress download — shared by the
+ * single-video flow and whichever item is currently active in a batch, so
+ * both look and behave identically.
+ */
+function DownloadStatus({
+  theme,
+  progress,
+  processing,
+  refreshing,
+}: {
+  theme: Theme
+  progress?: DownloadProgress
+  processing?: boolean
+  refreshing?: boolean
+}) {
+  if (processing) {
+    return (
+      <>
+        <ProgressBar percent={1} />
+        <Gap />
+        <Text>
+          <Text color={theme.primary}>
+            <Spinner type="dots" />
+          </Text>
+          <Text color={theme.gray} dimColor={theme.dimSecondary}> processing…</Text>
+        </Text>
+      </>
+    )
+  }
+  if (progress?.totalBytes) {
+    return (
+      <>
+        <ProgressBar percent={progress.downloadedBytes / progress.totalBytes} />
+        <Gap />
+        <Text color={theme.gray} dimColor={theme.dimSecondary}>{downloadMeta(progress)}</Text>
+      </>
+    )
+  }
+  if (progress) {
+    return (
+      <>
+        <Text>
+          <Text color={theme.primary}>
+            <Spinner type="dots" />
+          </Text>
+          <Text color={theme.gray} dimColor={theme.dimSecondary}> downloading…</Text>
+        </Text>
+        <Gap />
+        <Text color={theme.gray} dimColor={theme.dimSecondary}>{indeterminateMeta(progress)}</Text>
+      </>
+    )
+  }
+  return (
+    <>
+      <ProgressBar percent={0} />
+      <Gap />
+      <Text>
+        <Text color={theme.primary}>
+          <Spinner type="dots" />
+        </Text>
+        <Text color={theme.gray} dimColor={theme.dimSecondary}>
+          {refreshing ? ' link expired — grabbing a fresh one…' : ' starting download…'}
+        </Text>
+      </Text>
+    </>
+  )
+}
+
+export type Outcome = {filepath?: string; count?: number}
 
 type Phase =
   | {name: 'input'; warning?: string}
@@ -97,6 +169,9 @@ type Phase =
       refreshing?: boolean
     }
   | {name: 'done'; filepath: string}
+  | {name: 'batch-picking'}
+  | {name: 'batch-running'; preset: DownloadChoice}
+  | {name: 'batch-done'}
   | {name: 'error'; message: string}
 
 const HINTS: Record<Phase['name'], Array<[string, string]>> = {
@@ -119,6 +194,21 @@ const HINTS: Record<Phase['name'], Array<[string, string]>> = {
     ['^c', 'quit'],
   ],
   done: [['^c', 'quit']],
+  'batch-picking': [
+    ['↑↓', 'choose'],
+    ['↵', 'yeet all'],
+    ['esc', 'back'],
+    ['^c', 'quit'],
+  ],
+  'batch-running': [
+    ['s', 'skip'],
+    ['esc', 'cancel'],
+    ['^c', 'quit'],
+  ],
+  'batch-done': [
+    ['↵', 'done'],
+    ['^c', 'quit'],
+  ],
   error: [
     ['↵', 'try again'],
     ['^c', 'quit'],
@@ -167,13 +257,22 @@ function AppContent({
   const [choices, setChoices] = useState<DownloadChoice[]>([])
   const ytdlpRef = useRef('')
   const highlightRef = useRef(0) // choice under the cursor, for the ↵ hint click
+  const batchHighlightRef = useRef(0) // preset under the cursor in batch-picking
   const infoJsonRef = useRef<string | undefined>(undefined)
   const abortRef = useRef<AbortController | undefined>(undefined)
   const [phase, setPhase] = useState<Phase>(initialUrl ? {name: 'probing', status: 'warming up…'} : {name: 'input'})
 
+  // manually-queued urls (added with ^q), waiting for the batch to start
+  const [queue, setQueue] = useState<string[]>([])
+  // the working set once a batch (playlist or manual queue) has been built
+  const [batchLabel, setBatchLabel] = useState('')
+  const [batchItems, setBatchItems] = useState<BatchItem[]>([])
+  const batchControlRef = useRef<{cancelled: boolean; controller?: AbortController}>({cancelled: false})
+
   const columns = stdout?.columns && stdout.columns > 0 ? stdout.columns : 80
   const boxWidth = Math.max(14, Math.min(64, columns - 6))
   const contentWidth = Math.max(10, Math.min(columns - 4, 78))
+  const batchWidth = Math.max(20, Math.min(columns - 10, 60))
 
   const startProbe = useCallback(async (targetUrl: string) => {
     const controller = new AbortController()
@@ -187,11 +286,17 @@ function AppContent({
       ytdlpRef.current = ytdlp
       if (controller.signal.aborted) return
       setPhase({name: 'probing', status: 'fetching video info…'})
-      const {info: videoInfo, infoJsonPath} = await probe(ytdlp, targetUrl, controller.signal)
+      const result = await probe(ytdlp, targetUrl, controller.signal)
       if (controller.signal.aborted) return
-      infoJsonRef.current = infoJsonPath
-      setInfo(videoInfo)
-      setChoices(buildChoices(videoInfo))
+      if (result.kind === 'playlist') {
+        setBatchLabel(result.title)
+        setBatchItems(makeBatchItems(result.entries))
+        setPhase({name: 'batch-picking'})
+        return
+      }
+      infoJsonRef.current = result.infoJsonPath
+      setInfo(result.info)
+      setChoices(buildChoices(result.info))
       highlightRef.current = 0
       setPhase({name: 'picking'})
     } catch (error) {
@@ -210,6 +315,8 @@ function AppContent({
     setPlatform(undefined)
     setInfo(undefined)
     setChoices([])
+    setBatchLabel('')
+    setBatchItems([])
     setPhase({name: 'input'})
   }, [])
 
@@ -219,21 +326,131 @@ function AppContent({
     setUrlInput(url) // keep the link around so a cancel isn't destructive
   }, [resetToInput, url])
 
+  const startBatch = useCallback((initialItems: BatchItem[], preset: DownloadChoice) => {
+    batchControlRef.current = {cancelled: false}
+    let items = initialItems.map(item => ({...item}))
+    setBatchItems(items)
+    setPhase({name: 'batch-running', preset})
+
+    void (async () => {
+      let ytdlp: string
+      try {
+        ytdlp = ytdlpRef.current || (await ensureYtDlp(() => {}))
+        ytdlpRef.current = ytdlp
+      } catch (error) {
+        items = items.map(item => ({...item, status: 'error', error: error instanceof Error ? error.message : String(error)}))
+        setBatchItems(items)
+        setPhase({name: 'batch-done'})
+        return
+      }
+      const ffmpegLocation = await findFfmpeg()
+
+      for (let index = 0; index < items.length; index++) {
+        if (batchControlRef.current.cancelled) {
+          items = items.map((item, i) => (i >= index && item.status === 'pending' ? {...item, status: 'skipped'} : item))
+          setBatchItems(items)
+          break
+        }
+
+        const controller = new AbortController()
+        batchControlRef.current.controller = controller
+        items = items.map((item, i) => (i === index ? {...item, status: 'active'} : item))
+        setBatchItems(items)
+
+        try {
+          const handlers = {
+            onProgress: (progress: DownloadProgress) => {
+              items = items.map((item, i) => (i === index ? {...item, progress, processing: false} : item))
+              setBatchItems(items)
+            },
+            onProcessing: () => {
+              items = items.map((item, i) => (i === index ? {...item, processing: true} : item))
+              setBatchItems(items)
+            },
+          }
+          const filepath = await download(
+            {ytdlp, ffmpegLocation, url: items[index]!.url, choice: preset, outDir: OUT_DIR},
+            handlers,
+            controller.signal,
+          )
+          items = items.map((item, i) => (i === index ? {...item, status: 'done', filepath} : item))
+          setBatchItems(items)
+          setHistory(addToHistory(items[index]!.url))
+        } catch (error) {
+          if (controller.signal.aborted) {
+            // aborted on purpose — either "skip" (this item only) or "cancel" (whole batch)
+            items = items.map((item, i) => (i === index ? {...item, status: 'skipped'} : item))
+          } else {
+            items = items.map((item, i) =>
+              i === index
+                ? {...item, status: 'error', error: error instanceof Error ? error.message : String(error)}
+                : item,
+            )
+          }
+          setBatchItems(items)
+          if (batchControlRef.current.cancelled) {
+            items = items.map((item, i) => (i > index ? {...item, status: 'skipped'} : item))
+            setBatchItems(items)
+            break
+          }
+        }
+      }
+
+      onOutcome({count: items.filter(item => item.status === 'done').length})
+      setPhase({name: 'batch-done'})
+    })()
+  }, [onOutcome])
+
   useInput(
     (input, key) => {
       if (key.ctrl && input === 't') {
         cycleTheme()
         return
       }
-      if (key.escape && (phase.name === 'picking' || phase.name === 'error' || phase.name === 'done')) resetToInput()
-      if (key.escape && (phase.name === 'probing' || phase.name === 'downloading')) cancelRun()
-      if (key.return && (phase.name === 'error' || phase.name === 'done')) resetToInput()
+      if (key.ctrl && input === 'q' && phase.name === 'input') {
+        const trimmed = urlInput.trim()
+        if (isProbablyUrl(trimmed)) {
+          setQueue(q => [...q, trimmed])
+          setUrlInput('')
+        }
+        return
+      }
+      if (input === 's' && phase.name === 'batch-running') {
+        batchControlRef.current.controller?.abort()
+        return
+      }
+      if (key.escape && phase.name === 'batch-running') {
+        batchControlRef.current.cancelled = true
+        batchControlRef.current.controller?.abort()
+        return
+      }
+      if (key.escape && (phase.name === 'picking' || phase.name === 'batch-picking' || phase.name === 'error' || phase.name === 'done' || phase.name === 'batch-done')) {
+        resetToInput()
+      }
+      if (key.escape && phase.name === 'probing') cancelRun()
+      if (key.return && (phase.name === 'error' || phase.name === 'done' || phase.name === 'batch-done')) resetToInput()
     },
     {isActive: Boolean(process.stdin.isTTY)},
   )
 
   const handleUrlSubmit = (value: string) => {
     const trimmed = value.trim()
+
+    if (queue.length > 0) {
+      if (trimmed && !isProbablyUrl(trimmed)) {
+        setPhase({name: 'input', warning: 'that doesn’t look like a link — clear it or paste a full url'})
+        return
+      }
+      const urls = trimmed ? [...queue, trimmed] : [...queue]
+      setQueue([])
+      setUrlInput('')
+      const items = makeBatchItems(urls.map(u => ({url: u})))
+      setBatchLabel(`${items.length} queued link${items.length === 1 ? '' : 's'}`)
+      setBatchItems(items)
+      setPhase({name: 'batch-picking'})
+      return
+    }
+
     if (!isProbablyUrl(trimmed)) {
       setPhase({name: 'input', warning: 'that doesn’t look like a link — paste a full url'})
       return
@@ -242,7 +459,7 @@ function AppContent({
     void startProbe(trimmed)
   }
 
-  const clipboardOffered = Boolean(clipboardUrl) && urlInput === ''
+  const clipboardOffered = Boolean(clipboardUrl) && urlInput === '' && queue.length === 0
   const clipboardAccepted = Boolean(clipboardUrl) && urlInput === clipboardUrl
 
   const handlePick = (item: {value: number}) => {
@@ -282,9 +499,20 @@ function AppContent({
     })()
   }
 
+  const handleBatchPick = (item: {value: number}) => {
+    const preset = QUEUE_PRESETS[item.value]!
+    startBatch(batchItems, preset)
+  }
+
   let hints: Array<[string, string]> = [...HINTS[phase.name], ['^t', `theme:${theme.mode}`]]
-  if (phase.name === 'input' && history.length > 0) {
-    hints = [hints[0]!, ['↑', 'history'], ...hints.slice(1)]
+  if (phase.name === 'input') {
+    if (queue.length > 0) {
+      hints = [hints[0]!, ['^q', `queued (${queue.length})`], ...hints.slice(1)]
+    } else if (isProbablyUrl(urlInput.trim())) {
+      hints = [hints[0]!, ['^q', 'add to queue'], ...hints.slice(1)]
+    } else if (history.length > 0) {
+      hints = [hints[0]!, ['↑', 'history'], ...hints.slice(1)]
+    }
   }
 
   // Anything a mouse user would expect to press is clickable. Targets are
@@ -293,11 +521,22 @@ function AppContent({
   const hintAction = (key: string): (() => void) | undefined => {
     if (key === '^c') return () => exit()
     if (key === '^t') return cycleTheme
-    if (key === 'esc') return phase.name === 'probing' || phase.name === 'downloading' ? cancelRun : resetToInput
+    if (key === 'esc') {
+      if (phase.name === 'probing') return cancelRun
+      if (phase.name === 'batch-running') {
+        return () => {
+          batchControlRef.current.cancelled = true
+          batchControlRef.current.controller?.abort()
+        }
+      }
+      return resetToInput
+    }
+    if (key === 's' && phase.name === 'batch-running') return () => batchControlRef.current.controller?.abort()
     if (key === '↵') {
       if (phase.name === 'input') return () => handleUrlSubmit(urlInput)
       if (phase.name === 'picking') return () => handlePick({value: highlightRef.current})
-      if (phase.name === 'error' || phase.name === 'done') return resetToInput
+      if (phase.name === 'batch-picking') return () => handleBatchPick({value: batchHighlightRef.current})
+      if (phase.name === 'error' || phase.name === 'done' || phase.name === 'batch-done') return resetToInput
     }
     return undefined // ↑↓ / ↑ stay keyboard-only
   }
@@ -311,7 +550,12 @@ function AppContent({
       clickTargets.push({match: choiceLabel(choice), action: () => handlePick({value: index})})
     }
   }
-  if (phase.name === 'done') {
+  if (phase.name === 'batch-picking') {
+    for (const [index, choice] of QUEUE_PRESETS.entries()) {
+      clickTargets.push({match: choiceLabel(choice), action: () => handleBatchPick({value: index})})
+    }
+  }
+  if (phase.name === 'done' || phase.name === 'batch-done') {
     clickTargets.push({match: DONE_LABEL, padX: 4, padY: 1, action: resetToInput})
   }
   for (const [key, label] of hints) {
@@ -326,8 +570,11 @@ function AppContent({
       if (taglineRow > 3 && y - 1 >= taglineRow - 4 && y - 1 <= taglineRow - 2) {
         const span = frameRowSpan(y - 1)
         if (span && x >= span[0] - 1 && x <= span[1] + 1) {
-          if (phase.name === 'probing' || phase.name === 'downloading') cancelRun()
-          else if (phase.name !== 'input') resetToInput()
+          if (phase.name === 'probing') cancelRun()
+          else if (phase.name === 'batch-running') {
+            batchControlRef.current.cancelled = true
+            batchControlRef.current.controller?.abort()
+          } else if (phase.name !== 'input') resetToInput()
           return
         }
       }
@@ -335,6 +582,9 @@ function AppContent({
     },
     Boolean(process.stdin.isTTY),
   )
+
+  const batchActive = batchItems.find(item => item.status === 'active')
+  const batchSummaryCounts = batchSummary(batchItems)
 
   return (
     <FullScreen>
@@ -362,6 +612,10 @@ function AppContent({
           </FramedInput>
           {phase.warning ? (
             <Text color={theme.gray} dimColor={theme.dimSecondary}>✗ {phase.warning}</Text>
+          ) : queue.length > 0 ? (
+            <Text color={theme.gray} dimColor={theme.dimSecondary}>
+              {queue.length} link{queue.length === 1 ? '' : 's'} queued — ↵ to start, ^q to add another
+            </Text>
           ) : clipboardOffered ? (
             <Text color={theme.gray} dimColor={theme.dimSecondary}>link in your clipboard — ⇥ to paste it</Text>
           ) : clipboardAccepted ? (
@@ -411,6 +665,37 @@ function AppContent({
         </Box>
       )}
 
+      {phase.name === 'batch-picking' && (
+        <Box width={contentWidth}>
+          <Box flexDirection="column" flexGrow={1} flexBasis={0} paddingTop={1} paddingRight={3}>
+            {wrapText(batchLabel, Math.max(10, contentWidth - 41)).map((line, index) => (
+              <Text key={index} bold color={theme.primary}>
+                {line}
+              </Text>
+            ))}
+            <Gap />
+            <Text color={theme.gray} dimColor={theme.dimSecondary}>
+              ▸ {batchItems.length} video{batchItems.length === 1 ? '' : 's'} · same format for all
+            </Text>
+            <Gap />
+            <QueueList items={batchItems} width={Math.max(10, contentWidth - 41)} />
+          </Box>
+          <Panel title="Download" width={38}>
+            <SelectInput
+              indicatorComponent={ChoiceIndicator}
+              itemComponent={ChoiceItem}
+              items={QUEUE_PRESETS.map((choice, index) => ({
+                key: String(index),
+                label: choiceLabel(choice),
+                value: index,
+              }))}
+              onSelect={handleBatchPick}
+              onHighlight={item => (batchHighlightRef.current = item.value)}
+            />
+          </Panel>
+        </Box>
+      )}
+
       {phase.name === 'downloading' && (
         <Box flexDirection="column" alignItems="center">
           <Text color={theme.gray} dimColor={theme.dimSecondary}>
@@ -419,48 +704,25 @@ function AppContent({
           </Text>
           <Gap />
           {/* every branch is exactly three rows — bar, gap, meta — so the layout never jumps */}
-          {phase.processing ? (
-            <>
-              <ProgressBar percent={1} />
-              <Gap />
-              <Text>
-                <Text color={theme.primary}>
-                  <Spinner type="dots" />
-                </Text>
-                <Text color={theme.gray} dimColor={theme.dimSecondary}> processing…</Text>
-              </Text>
-            </>
-          ) : phase.progress?.totalBytes ? (
-            <>
-              <ProgressBar percent={phase.progress.downloadedBytes / phase.progress.totalBytes} />
-              <Gap />
-              <Text color={theme.gray} dimColor={theme.dimSecondary}>{downloadMeta(phase.progress)}</Text>
-            </>
-          ) : phase.progress ? (
-            <>
-              <Text>
-                <Text color={theme.primary}>
-                  <Spinner type="dots" />
-                </Text>
-                <Text color={theme.gray} dimColor={theme.dimSecondary}> downloading…</Text>
-              </Text>
-              <Gap />
-              <Text color={theme.gray} dimColor={theme.dimSecondary}>{indeterminateMeta(phase.progress)}</Text>
-            </>
-          ) : (
-            <>
-              <ProgressBar percent={0} />
-              <Gap />
-              <Text>
-                <Text color={theme.primary}>
-                  <Spinner type="dots" />
-                </Text>
-                <Text color={theme.gray} dimColor={theme.dimSecondary}>
-                  {phase.refreshing ? ' link expired — grabbing a fresh one…' : ' starting download…'}
-                </Text>
-              </Text>
-            </>
-          )}
+          <DownloadStatus theme={theme} progress={phase.progress} processing={phase.processing} refreshing={phase.refreshing} />
+        </Box>
+      )}
+
+      {phase.name === 'batch-running' && (
+        <Box flexDirection="column" alignItems="center">
+          <QueueList items={batchItems} width={batchWidth} />
+          <Gap />
+          <Text color={theme.gray} dimColor={theme.dimSecondary}>
+            {batchActive ? truncate(batchActive.title || batchActive.url, 46) : ''}
+          </Text>
+          <Gap />
+          <DownloadStatus theme={theme} progress={batchActive?.progress} processing={batchActive?.processing} />
+          <Gap />
+          <Text color={theme.gray} dimColor={theme.dimSecondary}>
+            {batchSummaryCounts.done}/{batchItems.length} done
+            {batchSummaryCounts.error ? ` · ${batchSummaryCounts.error} failed` : ''}
+            {batchSummaryCounts.skipped ? ` · ${batchSummaryCounts.skipped} skipped` : ''}
+          </Text>
         </Box>
       )}
 
@@ -471,6 +733,33 @@ function AppContent({
             <Text color={theme.primary}>find your file in:</Text>
           </Text>
           <Text color={theme.gray} dimColor={theme.dimSecondary}>{shortenPath(phase.filepath, os.homedir(), 60)}</Text>
+          <Gap />
+          <Box
+            borderStyle="round"
+            borderColor={theme.gray}
+            borderDimColor={theme.dimSecondary}
+            borderBackgroundColor={theme.background}
+            paddingX={3}
+          >
+            <Text bold color={theme.primary}>{DONE_LABEL}</Text>
+          </Box>
+        </Box>
+      )}
+
+      {phase.name === 'batch-done' && (
+        <Box flexDirection="column" alignItems="center">
+          <QueueList items={batchItems} width={batchWidth} />
+          <Gap />
+          <Text>
+            <Text bold color={theme.primary}>✓ {batchSummaryCounts.done}/{batchItems.length} yeeted</Text>
+            {batchSummaryCounts.error ? (
+              <Text color={theme.gray} dimColor={theme.dimSecondary}> · {batchSummaryCounts.error} failed</Text>
+            ) : null}
+            {batchSummaryCounts.skipped ? (
+              <Text color={theme.gray} dimColor={theme.dimSecondary}> · {batchSummaryCounts.skipped} skipped</Text>
+            ) : null}
+          </Text>
+          <Text color={theme.gray} dimColor={theme.dimSecondary}>saved to {shortenPath(OUT_DIR, os.homedir(), 60)}</Text>
           <Gap />
           <Box
             borderStyle="round"

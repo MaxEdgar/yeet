@@ -82,6 +82,17 @@ export type VideoInfo = {
   webpage_url?: string
   extractor_key?: string
   formats?: RawFormat[]
+  /** Present when the url resolved to a playlist/channel instead of a single video. */
+  entries?: RawEntry[]
+}
+
+type RawEntry = {
+  id?: string
+  title?: string
+  url?: string
+  webpage_url?: string
+  ie_key?: string
+  duration?: number
 }
 
 type RawFormat = {
@@ -97,15 +108,37 @@ type RawFormat = {
   filesize_approx?: number
 }
 
-export type ProbeResult = {
-  info: VideoInfo
-  /** Raw -J output saved to disk so downloads can skip re-extraction via --load-info-json. */
-  infoJsonPath: string
+export type PlaylistEntry = {url: string; title?: string; duration?: number}
+
+/** Best-effort resolution of a flat-playlist entry's watchable url. */
+function resolveEntryUrl(entry: RawEntry): string | undefined {
+  if (entry.webpage_url) return entry.webpage_url
+  if (entry.url && /^https?:\/\//i.test(entry.url)) return entry.url
+  if (entry.id && entry.ie_key?.toLowerCase().includes('youtube')) {
+    return `https://www.youtube.com/watch?v=${entry.id}`
+  }
+  return entry.url
 }
 
-export async function probe(ytdlp: string, url: string, signal?: AbortSignal): Promise<ProbeResult> {
+export type ProbeResult =
+  | {kind: 'video'; info: VideoInfo; infoJsonPath: string}
+  | {kind: 'playlist'; title: string; entries: PlaylistEntry[]}
+
+/**
+ * Probe a url for either a single video or a playlist/channel.
+ *
+ * `--no-playlist` and `--flat-playlist` are not mutually exclusive: the
+ * first only matters when a url carries both a video id and a list id
+ * (e.g. `watch?v=X&list=Y`) — it makes yt-dlp resolve just the video, so
+ * that case returns full format info same as always. A pure playlist or
+ * channel url has no single-video fallback, so it's extracted as a
+ * playlist regardless — `--flat-playlist` just keeps that cheap (id/title
+ * only, no per-entry format probing) since we only need a preset choice
+ * for the whole batch, not per-video formats.
+ */
+export async function probe(ytdlp: string, url: string, signal?: AbortSignal, depth = 0): Promise<ProbeResult> {
   const stdout = await new Promise<string>((resolve, reject) => {
-    const child = spawn(ytdlp, ['-J', '--no-playlist', '--no-warnings', url], {signal})
+    const child = spawn(ytdlp, ['-J', '--no-playlist', '--flat-playlist', '--no-warnings', url], {signal})
     let out = ''
     let stderr = ''
     child.stdout.on('data', chunk => (out += chunk))
@@ -120,16 +153,34 @@ export async function probe(ytdlp: string, url: string, signal?: AbortSignal): P
     })
   })
 
-  let info: VideoInfo
+  let data: VideoInfo
   try {
-    info = JSON.parse(stdout) as VideoInfo
+    data = JSON.parse(stdout) as VideoInfo
   } catch {
     throw new Error('Could not parse video info from yt-dlp.')
   }
 
+  if (Array.isArray(data.entries)) {
+    const mapped: Array<{url?: string; title?: string; duration?: number}> = data.entries.map(entry => ({
+      url: resolveEntryUrl(entry),
+      title: entry.title,
+      duration: entry.duration,
+    }))
+    const entries: PlaylistEntry[] = mapped.filter((entry): entry is PlaylistEntry => Boolean(entry.url)) as PlaylistEntry[]
+
+    if (entries.length > 1) return {kind: 'playlist', title: data.title || 'Playlist', entries}
+    if (entries.length === 1) {
+      // a "playlist" of one — re-probe the single entry directly so we get
+      // its real formats instead of falling back to generic presets
+      if (depth >= 3) throw new Error('Could not resolve this playlist entry.')
+      return probe(ytdlp, entries[0]!.url, signal, depth + 1)
+    }
+    throw new Error('This playlist has no downloadable videos.')
+  }
+
   const infoJsonPath = path.join(os.tmpdir(), `yeet-info-${process.pid}-${Date.now()}.json`)
   await fs.writeFile(infoJsonPath, stdout)
-  return {info, infoJsonPath}
+  return {kind: 'video', info: data, infoJsonPath}
 }
 
 export type DownloadChoice = {
@@ -193,6 +244,32 @@ function scoreVideo(f: RawFormat): number {
   if (f.vcodec?.startsWith('avc')) score += 5_000
   return score
 }
+
+/**
+ * Generic quality tiers for batch downloads (playlists, manual queues).
+ * Unlike `buildChoices`, these apply uniformly across many videos whose
+ * exact available formats we don't know upfront — yt-dlp's own selector
+ * fallback chains (`[height<=N]`) pick the closest match per video.
+ */
+export const QUEUE_PRESETS: DownloadChoice[] = [
+  {kind: 'video', label: 'best available · mp4', args: ['-f', 'bv*+ba/b', '--merge-output-format', 'mp4']},
+  {
+    kind: 'video',
+    label: '1080p · mp4',
+    args: ['-f', 'bv*[height<=1080]+ba/b[height<=1080]/b', '--merge-output-format', 'mp4'],
+  },
+  {
+    kind: 'video',
+    label: '720p · mp4',
+    args: ['-f', 'bv*[height<=720]+ba/b[height<=720]/b', '--merge-output-format', 'mp4'],
+  },
+  {
+    kind: 'video',
+    label: '480p · mp4',
+    args: ['-f', 'bv*[height<=480]+ba/b[height<=480]/b', '--merge-output-format', 'mp4'],
+  },
+  {kind: 'audio', label: 'audio only · mp3', args: ['-f', 'ba/b', '-x', '--audio-format', 'mp3', '--audio-quality', '0']},
+]
 
 export type DownloadProgress = {
   downloadedBytes: number
