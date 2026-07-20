@@ -1,18 +1,26 @@
-# Yeet
+<div align="center">
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
   <img src="assets/logo-light.svg" alt="yeet" width="288">
 </picture>
 
-Yeet any video. paste. yeet. done.
+**Yeet any video. Paste. Yeet. Done.**
 
-Download videos from YouTube, X/Twitter, Instagram, Threads, TikTok and
-1,800+ other sites — right from your terminal. Paste a url, pick a
-resolution (or audio-only mp3), done. No popups, no fake download buttons,
-no sketchy redirects.
+Download from YouTube, X/Twitter, Instagram, Threads, TikTok and 1,800+ other
+sites — right from your terminal.
+
+[![npm version](https://img.shields.io/npm/v/yeet?style=flat-square&color=black&labelColor=black)](https://www.npmjs.com/package/yeet)
+[![npm downloads](https://img.shields.io/npm/dm/yeet?style=flat-square&color=black&labelColor=black)](https://www.npmjs.com/package/yeet)
+[![node](https://img.shields.io/node/v/yeet?style=flat-square&color=black&labelColor=black)](package.json)
+[![license](https://img.shields.io/npm/l/yeet?style=flat-square&color=black&labelColor=black)](LICENSE)
 
 <img src="assets/home.png" alt="yeet home screen — paste a link and hit yeet" width="100%">
+
+</div>
+
+Paste a url, pick a resolution (or audio-only mp3), done. No popups, no fake
+download buttons, no sketchy redirects.
 
 ## Install
 
@@ -32,35 +40,40 @@ automatically.
 ## Usage
 
 ```sh
-$ yeet https://youtu.be/dQw4w9WgXcQ    # straight to the format picker
-$ yeet                                 # prompts for a url
-$ yeet --theme light                   # force the light palette
+yeet https://youtu.be/dQw4w9WgXcQ    # straight to the format picker
+yeet                                 # prompts for a url
+yeet --theme light                   # force the light palette
 ```
 
-Yeet takes over the terminal (full-screen, centered — and restores your
-scrollback on exit). Pick a format with ↑/↓ (or j/k, or number keys) and
-hit enter. `esc` goes back, `^c` quits. Or just use the mouse — the yeet
-button, the format list and the footer hints are all clickable, and
-clicking the logo takes you back home. Files are saved to `~/Downloads`,
-and the file path is printed to your terminal when you're done.
+Yeet takes over the terminal — full-screen, centered, and it restores your
+scrollback on exit. Pick a format with `↑`/`↓` (or `j`/`k`, or number keys)
+and hit enter. `esc` goes back, `^c` quits. Or just use the mouse — the yeet
+button, the format list, and the footer hints are all clickable, and clicking
+the logo takes you home. Files are saved to `~/Downloads`, with the final
+path printed once the download finishes.
 
-The default `auto` theme uses your terminal's own foreground and background,
-so it follows light and dark terminal themes without guessing. Press `^t` or
-click the theme control in the footer to cycle through `auto`, `light`, and
-`dark` for the current session. Use `--theme auto`, `--theme light`, or
-`--theme dark` to choose the starting theme for one launch.
+The default `auto` theme borrows your terminal's own foreground and
+background, so it follows light and dark terminal themes without guessing.
+Press `^t` or click the theme control in the footer to cycle through `auto`,
+`light`, and `dark` for the current session. Use `--theme auto`,
+`--theme light`, or `--theme dark` to set the starting theme for one launch.
 
+<div align="center">
 <img src="assets/download-options.png" alt="yeet format picker — resolutions with estimated file sizes, plus audio-only mp3" width="100%">
+</div>
 
 ## How it works
 
-- Powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp). On first run,
-  yeet downloads the standalone yt-dlp binary to `~/.yeet/bin` —
-  no Python required. If you already have yt-dlp installed, it uses yours.
-- ffmpeg (needed for merging high-res streams and mp3 extraction) is found
-  on your PATH, with `ffmpeg-static` as a bundled fallback.
-- The UI is [Ink](https://github.com/vadimdemedes/ink) — React for the
-  terminal.
+**Extraction** — Powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp). On
+first run, yeet downloads the standalone binary to `~/.yeet/bin`, no Python
+required. If you already have yt-dlp installed, it uses yours.
+
+**Muxing** — `ffmpeg` is found on your PATH when available, with
+`ffmpeg-static` bundled as a fallback, for merging high-res streams and mp3
+extraction.
+
+**Interface** — Built with [Ink](https://github.com/vadimdemedes/ink) —
+React for the terminal.
 
 ## Development
 
@@ -75,21 +88,12 @@ npm run typecheck
 To try it as a global command without publishing: `npm link`, then run
 `yeet` anywhere.
 
-## Roadmap
+## Use responsibly
 
-- [ ] `--best` / `--mp3` flags to skip the picker (scriptable mode)
-- [ ] `-o <dir>` to choose the output folder
-- [ ] Playlist / thread-with-multiple-videos support
-- [ ] Clipboard detection: launch bare and auto-suggest the url you copied
-- [ ] Self-update for the bundled yt-dlp binary (`yt-dlp -U`)
-- [x] Publish to npm (`npm i -g yeet` / `npx yeet`)
-- [ ] `curl yeet.sh | sh` installer
-
-## A note on fair use
-
-Yeet is a personal-archiving tool. Downloading content may violate a
-platform's terms of service — only download what you have the right to
-keep, and be excellent to creators.
+Yeet is built for personal archiving, not for skirting a platform's rules.
+Some sites' terms of service restrict downloading their content — that's on
+you to check. Keep what you're entitled to keep, credit the people who made
+it, and don't use this to rip off creators.
 
 ## License
 
