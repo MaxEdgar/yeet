@@ -15,6 +15,8 @@ sites — right from your terminal.
 [![node](https://img.shields.io/node/v/yeet?style=flat-square&color=black&labelColor=black)](package.json)
 [![license](https://img.shields.io/npm/l/yeet?style=flat-square&color=black&labelColor=black)](LICENSE)
 
+Created by [MaxEdgar](https://github.com/MaxEdgar)
+
 <img src="assets/home.png" alt="yeet home screen — paste a link and hit yeet" width="100%">
 
 </div>
